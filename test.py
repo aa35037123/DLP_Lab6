@@ -67,7 +67,7 @@ def compute_prev_x(xt, t, pred_noise, args, batch_size):
     
 def train(args, model, device, train_loader, test_loader, optimizer, lr_scheduler, accelerator):
     model.train()
-    noise_scheduler = DDPMScheduler(num_train_timesteps=time_step)
+    # noise_scheduler = DDPMScheduler(num_train_timesteps=time_step)
     for epoch in range(1, args.epochs+1):
         for batch_idx, (data, condition) in enumerate(train_loader):
             data, condition = data.to(device,dtype=torch.float32), condition.to(device)
@@ -79,9 +79,9 @@ def train(args, model, device, train_loader, test_loader, optimizer, lr_schedule
             # select noise
             noise = torch.randn(data.shape[0], 3, 64, 64) # why this shape?
             xt = compute_xt(args, data, rand_t, noise)
-            noisy_image = noise_scheduler.add_noise(xt.to(args.device), noise.to(args.device), 
-                random.choice(rand_t)-1)
-            output = model(sample=noisy_image.to(args.device), timestep=rand_t.to(args.device), 
+            # noisy_image = noise_scheduler.add_noise(xt.to(args.device), noise.to(args.device), 
+            #     random.choice(rand_t)-1)
+            output = model(sample=xt.to(args.device), timestep=rand_t.to(args.device), 
                 class_labels=condition.to(torch.float32))
             loss_function = nn.MSELoss()
             loss = loss_function(output.sample.to(args.device), noise.to(args.device))
@@ -93,12 +93,11 @@ def train(args, model, device, train_loader, test_loader, optimizer, lr_schedule
                 print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.10f}'.format(
                     epoch, batch_idx * len(data), len(train_loader.dataset),
                         ((100 * batch_idx) / len(train_loader)), loss.item()))
-            sample(model, device, test_loader, args, "test_"+str(epoch))
         if args.save_model and (epoch % args.save_interval)==0:
-            path = os.path.join(args.ckpt, 'train_epoch='+str(epoch)+'.pt')
-            torch.save(model.state_dict(), path)
-        print("==test.json==")
-        # sample(model, device, test_loader, args, "test_"+str(epoch))
+            # path = os.path.join(args.ckpt, 'train_epoch='+str(epoch)+'.pt')
+            model.save_pretrained(args.ckpt+"/local-unet"+"epoch_"+str(epoch), variant="non_ema")
+            print("==test.json==")
+            sample(model, device, test_loader, args, "test_"+str(epoch))
 
 def save_images(images, filename, args):
     grid = torchvision.utils.make_grid(images.detach().cpu().clip(-1, 1), nrow=8)
@@ -108,6 +107,11 @@ def save_images(images, filename, args):
     
 def sample(model, device, test_loader, args, filename):
     model.eval()
+    # denoising
+    transform=transforms.Compose([
+            transforms.Normalize((0, 0, 0), (1/0.5, 1/0.5, 1/0.5)),
+            transforms.Normalize((-0.5, -0.5, -0.5), (1, 1, 1)),
+    ])
     with torch.no_grad():
         # img here is a dummy value
         best_acc = 0
@@ -117,18 +121,17 @@ def sample(model, device, test_loader, args, filename):
         best_acc_file_path = None
         for batch_idx, (img, condition) in enumerate(test_loader):
             xt = torch.randn(args.test_batch, 3, 64, 64)
-            if args.mode == 'test':
-                filename = 'test_' + str(batch_idx)
             condition = condition.to(device, dtype=torch.float32).squeeze()
             # reconstruct image
             for t in range(time_step, 0, -1):
                 # let batch number of xt the same as condition
                 output = model(sample=xt[:condition.shape[0]].to(device, dtype=torch.float32), 
                     timestep=t, class_labels=condition)
-                print(f'Shpae of output : {output.shape}')
-                print(f'output : {output}')
                 xt = compute_prev_x(xt.to(device, dtype=torch.float32), t, output.sample.to(device), 
                     args, args.test_batch)
+                if t%100==1 or t==time_step:
+                    img = transform(xt)
+                    save_images(img, f'{filename}_{t}', args)
             # evaluate
             evaluate = evaluation_model()
             txt_path = os.path.join(args.save_root, args.mode, 'txt_file', f'{filename}.txt')
@@ -136,14 +139,16 @@ def sample(model, device, test_loader, args, filename):
             # img_path = os.path.join(args.ckpt, f'{filename}.png')
             if acc > best_acc:
                 best_xt = xt
+                best_xt_name = f'{filename}_{t}'
             print(f'The result: {acc}')
             if not os.path.exists(txt_path):
                 with open(txt_path, "w") as file:
                     pass
             with open(txt_path, 'a') as test_record:
                 test_record.write((f'Accuracy : {acc}\n'))
-                
-        save_images(best_xt, filename, args)
+        
+        best_img = transform(best_xt)
+        save_images(best_img, best_xt_name, args)
 
 def main():
     # Training settings
@@ -198,26 +203,22 @@ def main():
             "UpBlock2D",
         ))
     # overwrite class_embedding because there are 24 different objects 
+    # optimizer 
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer = optimizer, 
+        num_warmup_steps = 0, 
+        num_training_steps = len(train_loader)*500)
     model.class_embedding = nn.Linear(24, 512)
-    if args.test_only:
-        # load model 
-        # model = UNet2DModel.from_pretrained(pretrained_model_name_or_path = 'local-unetepoch_20', 
-        #     variant = 'non_ema', from_tf=True, low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
-        # model.class_embedding = nn.Linear(24, 512)
-        # state_dict = torch.load('./ckpt/test_22.pt')
-        # # key[16:] is used to remove 'class_embedding.' just keep 'weight' or 'bias'
-        # filter_state_dict = {k[16:]:v for k, v in state_dict.items() if k == 'class_embedding.weight' or k == 'class_embedding.bias'}
-        # model.class_embedding.load_state_dict(filter_state_dict)
-        
-        model.load_state_dict(torch.load(args.load_model))
-    else:
-        
-        # optimizer 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-        lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer = optimizer, 
-            num_warmup_steps = 0, 
-            num_training_steps = len(train_loader)*500)
+    if args.pretrain:
+        model = UNet2DModel.from_pretrained(pretrained_model_name_or_path =os.path.join(args.ckpt, 'local-unetepoch_5'),  
+            variant="non_ema", from_tf=True,low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
+        model.class_embedding = nn.Linear(24 ,512)
+        state_dict = torch.load("local-unetepoch_15/diffusion_pytorch_model.non_ema.bin")
+        filtered_state_dict = {k[16:]: v for k, v in state_dict.items() if k =="class_embedding.weight" or k=="class_embedding.bias"}
+        model.class_embedding.load_state_dict(filtered_state_dict)
+        model = model.to(args.device)
+
     
     model = model.to(args.device)
     
@@ -229,6 +230,9 @@ def main():
     if not args.test_only:
         train(args, model, device, train_loader, test_loader, optimizer, lr_scheduler, accelerator)
     else:
+        print('-----test-----')
+        sample(model, device, test_loader_new, args, None)
+        print('-----new_test-----')
         sample(model, device, test_loader_new, args, None)
 if __name__ == '__main__':
     main()
